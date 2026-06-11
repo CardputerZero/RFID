@@ -1,0 +1,19 @@
+{
+  "package_name": "rfid",
+  "version": "0.1",
+  "app_name": "RFID",
+  "bin_name": "M5CardputerZero-RFID",
+  "icon": "share/images/ic_rfid.png",
+  "description": "CardputerZero RFID Independent Application",
+  "title": "RFID",
+  "summary": "Scan, dump, emulate and manage NFC/UHF tags",
+  "categories": ["Utilities", "Development"],
+  "license": "MIT",
+  "source_repo": "https://github.com/CardputerZero/RFID",
+  "permissions": {
+    "keyboard_input": true,
+    "external_hardware": true,
+    "filesystem": "app-data-only",
+    "network": false
+  }
+}

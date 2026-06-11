@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=RFID
+Exec=/usr/share/APPLaunch/apps/rfid/M5CardputerZero-RFID
+Terminal=false
+Icon=share/images/ic_rfid.png
+Type=Application

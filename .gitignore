@@ -1,0 +1,37 @@
+# Build artifacts
+build/
+dist/
+static_lib/
+dist_mfkey/
+.sconsign.dblite
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+dist_stage/
+
+# Python tools
+__pycache__/
+*.pyc
+tools/__pycache__/
+
+# macOS
+.DS_Store
+
+# screenshots
+screenshots/.DS_Store
+
+# Build artifacts
+build/
+dist/
+dist_stage/
+dist_mfkey/
+.sconsign.dblite
+
+# Platform
+screenshots/
+packaging/
+nfc_i2c_magic_probe.cpp

@@ -1,0 +1,63 @@
+import os
+
+Import("env")
+with open(env["PROJECT_TOOL_S"]) as f:
+    exec(f.read())
+
+component_dir = env.get("component_dir", os.getcwd())
+projects_dir = os.path.abspath(os.path.join(component_dir, "..", ".."))
+emulator_vendor = os.path.join(projects_dir, "CardputerZero-Emulator", "vendor")
+nfc_shared_root = os.path.join(component_dir, "ui", "components")
+
+SRCS = Glob("src/*.c*")
+SRCS += [os.path.join(component_dir, "hal", "hal_paths_rfid.c")]
+SRCS += [os.path.join(component_dir, "hal", "hal_settings_rfid.c")]
+INCLUDE = [
+    ADir("."),
+    ADir("include"),
+    nfc_shared_root,
+    emulator_vendor,
+]
+PRIVATE_INCLUDE = []
+REQUIREMENTS = ["lvgl_component", "pthread"]
+if "CONFIG_V9_5_LV_USE_SDL" not in os.environ:
+    REQUIREMENTS += ["input", "xkbcommon", "udev"]
+STATIC_LIB = []
+DYNAMIC_LIB = []
+DEFINITIONS = ["-std=c++17"]
+DEFINITIONS_PRIVATE = []
+LDFLAGS = ["-Wl,--allow-shlib-undefined"]
+LINK_SEARCH_PATH = []
+STATIC_FILES = []
+
+lvgl_component = list(filter(lambda x: x["target"] == "lvgl_component", env["COMPONENTS"]))[0]
+if "CONFIG_V9_5_LV_USE_SDL" in os.environ:
+    lvgl_component["REQUIREMENTS"] += ["SDL2"]
+    sdl_include_candidates = [
+        "/usr/include/SDL2",
+        "/opt/homebrew/include",
+        "/opt/homebrew/include/SDL2",
+    ]
+    lvgl_component["INCLUDE"] += [path for path in sdl_include_candidates if os.path.exists(path)]
+    if os.path.exists("/opt/homebrew/lib"):
+        lvgl_component.setdefault("LINK_SEARCH_PATH", [])
+        lvgl_component["LINK_SEARCH_PATH"] += ["/opt/homebrew/lib"]
+    lvgl_component["DEFINITIONS"] += ["-D_REENTRANT"]
+
+env["COMPONENTS"].append(
+    {
+        "target": "M5CardputerZero-RFID",
+        "SRCS": SRCS,
+        "INCLUDE": INCLUDE,
+        "PRIVATE_INCLUDE": PRIVATE_INCLUDE,
+        "REQUIREMENTS": REQUIREMENTS,
+        "STATIC_LIB": STATIC_LIB,
+        "DYNAMIC_LIB": DYNAMIC_LIB,
+        "DEFINITIONS": DEFINITIONS,
+        "DEFINITIONS_PRIVATE": DEFINITIONS_PRIVATE,
+        "LDFLAGS": LDFLAGS,
+        "LINK_SEARCH_PATH": LINK_SEARCH_PATH,
+        "STATIC_FILES": STATIC_FILES,
+        "REGISTER": "project",
+    }
+)

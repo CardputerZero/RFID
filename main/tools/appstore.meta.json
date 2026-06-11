@@ -1,0 +1,22 @@
+{
+  "title": "RFID",
+  "summary": "Scan, dump, emulate and manage NFC/UHF tags",
+  "description": "RFID standalone app for CardputerZero. Supports READ/SAVED/EMU/TOOLS workflow, NFC Unit, PN532 and PN532Killer scenarios.",
+  "locales": {
+    "zh-CN": {
+      "title": "RFID",
+      "summary": "NFC/UHF 扫描、Dump、模拟与工具集"
+    }
+  },
+  "categories": ["Utilities", "Development"],
+  "license": "MIT",
+  "source_repo": "https://github.com/CardputerZero/RFID",
+  "icon": "share/images/ic_rfid.png",
+  "screenshots": ["screenshots/01.png"],
+  "permissions": {
+    "keyboard_input": true,
+    "external_hardware": true,
+    "filesystem": "app-data-only",
+    "network": false
+  }
+}
