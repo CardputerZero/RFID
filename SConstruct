@@ -53,6 +53,18 @@ env = SConscript(
     duplicate=0,
 )
 
+# ── Inject git commit hash as compile-time define for AppInfo modal ──────────
+try:
+    import subprocess
+    git_hash = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"],
+        text=True, cwd=os.getcwd()
+    ).strip()
+    env.Append(CPPDEFINES={"RFID_BUILD_HASH": '"{}"'.format(git_hash)})
+    print("[RFID] Build version: {}".format(git_hash))
+except Exception:
+    pass  # fallback: code uses __DATE__ __TIME__
+
 if not os.path.exists(static_lib):
     update = True
 else:

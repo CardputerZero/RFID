@@ -1387,6 +1387,32 @@ public:
         return true;
     }
 
+    // Re-select the current target with a bare InListPassiveTarget,
+    // WITHOUT classify_type2_tag() probes. Used before write so the
+    // card is in a clean selected state.
+    bool iso14443a_reselect_for_write(std::string *error = nullptr)
+    {
+        // Release current target, then re-list
+        in_release_all();
+        target_listed_ = false;
+
+        const std::vector<uint8_t> frame = Pn532FrameCodec::build_command(0x4A, {0x01, 0x00});
+        if (transport_->write_bytes(frame.data(), frame.size(), error) < 0) return false;
+        std::vector<uint8_t> rx;
+        if (!collect_response(&rx, error)) return false;
+        std::vector<uint8_t> data;
+        if (!Pn532FrameCodec::parse_first_frame(rx, &data)) {
+            if (error) *error = "no card response";
+            return false;
+        }
+        if (data.size() < 3 || data[0] != 0xD5 || data[1] != 0x4B || data[2] == 0x00) {
+            if (error) *error = "card not found";
+            return false;
+        }
+        target_listed_ = true;
+        return true;
+    }
+
     // InDataExchange (0x40): send data to selected target, receive response.
     // tg: target number (0x01 for first target).
     // data: command bytes for the target (e.g. auth or read).

@@ -1,5 +1,10 @@
 #pragma once
 
+// Build version: override via -DRFID_BUILD_HASH='"abc1234"' at compile time
+#ifndef RFID_BUILD_HASH
+#define RFID_BUILD_HASH "dev-" __DATE__ " " __TIME__
+#endif
+
 #include "nfc/nfc_device_service.hpp"
 #include "../ui_app_page.hpp"
 #include "compat/input_keys.h"
@@ -201,6 +206,8 @@ private:
     bool nfcunit_write_running_ = false;
     bool nfcunit_write_result_ok_ = false;
     std::string nfcunit_write_result_msg_;
+    std::string write_progress_bar_;   // "....x..." per-block result chars
+    int write_progress_total_ = 0;     // total blocks to write
     std::thread nfcunit_write_thread_;
     // Hex log overlay scroll offset (line index from top)
     int hex_log_scroll_ = 0;
@@ -897,6 +904,8 @@ private:
             }
             break;
         case KEY_ESC:
+            // Show hint: user must hold ESC for 5s to exit
+            show_toast("Press ESC for 5s to exit");
             break;
         default:
             break;
@@ -1150,13 +1159,33 @@ private:
         const auto rec = saved_records_[saved_index];
         nfcunit_write_running_ = true;
         nfcunit_write_result_ok_ = false;
+        write_progress_bar_.clear();
+        // Count actual writable pages/blocks (skip NTAG pages 0-3, skip empty lines)
+        write_progress_total_ = 0;
+        int line_idx = 0;
+        for (const auto &line : rec.tag.raw_data) {
+            if (line.empty()) { ++line_idx; continue; }
+            // Parse page/block number
+            int idx = line_idx;
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                try { idx = std::stoi(line.substr(0, colon)); } catch (...) { idx = line_idx; }
+            }
+            if (rec.tag.protocol == nfc_app::ProtocolKind::Iso14443A) {
+                if (idx >= 4) ++write_progress_total_;  // skip NTAG pages 0-3
+            } else {
+                ++write_progress_total_;
+            }
+            ++line_idx;
+        }
         nfcunit_write_result_msg_ = "Writing...";
-        ui_message_ = "Write started, place tag...";
+        ui_message_ = "Writing: ";
 
         nfcunit_write_thread_ = std::thread([this, rec]() {
             std::string err;
             std::function<void(const std::string &)> progress_cb = [this](const std::string &line) {
                 nfcunit_write_result_msg_ = line;
+                update_write_progress(line);
             };
             bool ok = service_.nfcunit_write_tag(rec, &progress_cb, &err);
             nfcunit_write_result_ok_ = ok;
@@ -1165,19 +1194,84 @@ private:
         nfcunit_write_thread_.detach();
     }
 
+    void update_write_progress(const std::string &line)
+    {
+        // All write progress messages start with "Write page" or "Write block"
+        if (line.find("Write page") == 0 || line.find("Write block") == 0) {
+            // Check for failure keywords: failed, NAK, timeout, error
+            bool success = (line.find("failed") == std::string::npos &&
+                            line.find("NAK") == std::string::npos &&
+                            line.find("timeout") == std::string::npos &&
+                            line.find("error") == std::string::npos);
+            write_progress_bar_ += success ? '.' : 'x';
+            ui_message_ = "Writing: " + write_progress_bar_;
+        } else if (line.find("Scanning") != std::string::npos ||
+                   line.find("Found") != std::string::npos) {
+            // Scan/card detection messages show directly
+            ui_message_ = line;
+        }
+        // Other messages (final summaries like "NTAG write done: N pages") are ignored
+        // — they're shown in the final poll result
+    }
+
     void poll_nfcunit_write_result()
     {
         if (!nfcunit_write_running_) return;
-        // Check if still running by trying to join — but it's detached.
-        // We use the message as a simple completion signal:
-        // When the thread writes to result_msg_ (atomic-like), we consume it.
-        // Since we can't join a detached thread, we use a dirty flag check:
-        // The thread sets msg to "Write complete" or "Write failed:*" on finish.
         const auto &msg = nfcunit_write_result_msg_;
         if (msg == "Write complete" || msg.find("Write failed:") == 0) {
-            ui_message_ = msg;
+            // Build summary with progress bar
+            int ok_count = 0, fail_count = 0;
+            for (char c : write_progress_bar_) {
+                if (c == '.') ++ok_count; else if (c == 'x') ++fail_count;
+            }
+            int total = write_progress_total_;
+            int bar_w = 16;
+            int filled = total > 0 ? (ok_count * bar_w / total) : 0;
+            std::string bar;
+            for (int i = 0; i < bar_w; ++i) bar += (i < filled) ? '#' : '_';
+            ui_message_ = msg + " [" + bar + "] " + std::to_string(ok_count) + "/" + std::to_string(total);
             nfcunit_write_running_ = false;
         }
+    }
+
+    void start_pn532_write_async(int saved_index)
+    {
+        if (nfcunit_write_running_) return;
+        const auto rec = saved_records_[saved_index];
+        nfcunit_write_running_ = true;
+        nfcunit_write_result_ok_ = false;
+        write_progress_bar_.clear();
+        // Count actual writable pages/blocks
+        write_progress_total_ = 0;
+        int line_idx = 0;
+        for (const auto &line : rec.tag.raw_data) {
+            if (line.empty()) { ++line_idx; continue; }
+            int idx = line_idx;
+            size_t colon = line.find(':');
+            if (colon != std::string::npos) {
+                try { idx = std::stoi(line.substr(0, colon)); } catch (...) { idx = line_idx; }
+            }
+            if (rec.tag.protocol == nfc_app::ProtocolKind::Iso14443A) {
+                if (idx >= 4) ++write_progress_total_;
+            } else {
+                ++write_progress_total_;
+            }
+            ++line_idx;
+        }
+        nfcunit_write_result_msg_ = "Writing...";
+        ui_message_ = "Writing: ";
+
+        nfcunit_write_thread_ = std::thread([this, rec]() {
+            std::string err;
+            std::function<void(const std::string &)> progress_cb = [this](const std::string &line) {
+                nfcunit_write_result_msg_ = line;
+                update_write_progress(line);
+            };
+            bool ok = service_.pn532_write_tag(rec, &progress_cb, &err);
+            nfcunit_write_result_ok_ = ok;
+            nfcunit_write_result_msg_ = ok ? "Write complete" : ("Write failed: " + err);
+        });
+        nfcunit_write_thread_.detach();
     }
 
     static std::string trim_ascii(const std::string &in)
@@ -4026,7 +4120,7 @@ private:
         const auto conn = service_.connection_state();
         const auto ep   = service_.current_endpoint();
 
-        lv_obj_t *card = make_modal_card(parent, 308, 110, 0x00D2FF);
+        lv_obj_t *card = make_modal_card(parent, 308, 125, 0x00D2FF);
         create_text(card, 8, 4, "Device Info", 0x00D2FF, 12);
 
         char buf[64];
@@ -4058,6 +4152,13 @@ private:
         // Row 4: PN532 ready flag (useful for debug)
         std::snprintf(buf, sizeof(buf), "NFC Rdy: %s", conn.pn532_ready ? "yes" : "no");
         create_text(card, 8, 74, buf, conn.pn532_ready ? 0x44FF88 : 0x888888, 11);
+
+        // Row 5: build version hash
+        {
+            const char *hash = RFID_BUILD_HASH;
+            std::snprintf(buf, sizeof(buf), "Build:   %.42s", hash);
+            create_text(card, 8, 87, buf, 0x777777, 9);
+        }
     }
 
     // ── Tools-specific modal overlay ─────────────────────────────────────────
@@ -4825,24 +4926,27 @@ private:
         const auto emu_kind = effective_emu_device_kind(conn);
         const bool is_i2c_dev = (emu_kind == nfc_app::DeviceKind::GroveNFC ||
                                  emu_kind == nfc_app::DeviceKind::NFCUnit);
+        const bool is_pn532_dev = (emu_kind == nfc_app::DeviceKind::PN532 ||
+                                   emu_kind == nfc_app::DeviceKind::PN532Killer);
+        const bool is_pn532killer = (emu_kind == nfc_app::DeviceKind::PN532Killer);
+        const bool is_pn532_plain = (emu_kind == nfc_app::DeviceKind::PN532);
         const bool is_nfcunit = (emu_kind == nfc_app::DeviceKind::NFCUnit);
         const auto &rec = saved_records_[saved_idx_];
-        // Also check record metadata: dumps captured from I2C (NFCUnit/GroveNFC) should
-        // always show "Write to Tag", even when the device is not currently connected.
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
-        const bool show_write_to_tag = is_i2c_dev || record_from_i2c;
-        // NFCUnit/GroveNFC connected: Emulate + Write, 5 options
-        // I2C record without active I2C connection: Upload to Slot + Write, 5 options
-        // Non-I2C record: Upload to Slot, 4 options
-        const int n_opts = show_write_to_tag ? 5 : 4;
+        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
+        const bool has_first_action = is_i2c_dev || is_pn532killer;
+        const int n_opts = has_first_action ? (show_write_to_tag ? 5 : 4)
+                                            : (show_write_to_tag ? 4 : 3);
         const lv_coord_t card_h = static_cast<lv_coord_t>(24 + n_opts * 20);
-        // Width 220, dynamic height based on option count
         lv_obj_t *card = make_modal_card(parent, 220, card_h, 0xF7A600);
         create_text(card, 8, 6, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
 
-        const char *upload_label = is_i2c_dev ? "Emulate" : "Upload to Slot...";
-        std::vector<const char *> options = {upload_label};
+        std::vector<const char *> options;
         if (show_write_to_tag) options.push_back("Write to Tag");
+        if (is_i2c_dev)
+            options.push_back("Emulate");
+        else if (is_pn532killer)
+            options.push_back("Upload to Slot...");
         options.push_back("Edit Name");
         options.push_back("Edit Hex Data");
         options.push_back("Delete");
@@ -4911,10 +5015,14 @@ private:
     static std::string strip_to_hex(const std::string &s)
     {
         std::string result;
-        // Skip "Block N: " or similar prefix before the first colon+space
+        // Skip "Block N: " or "N: " or "N:" prefix
         size_t start = 0;
-        const size_t colon = s.find(": ");
-        if (colon != std::string::npos) start = colon + 2;
+        const size_t colon_space = s.find(": ");
+        const size_t colon = s.find(':');
+        if (colon_space != std::string::npos)
+            start = colon_space + 2;
+        else if (colon != std::string::npos && colon + 1 < s.size())
+            start = colon + 1;
         for (size_t i = start; i < s.size(); ++i) {
             const unsigned char c = static_cast<unsigned char>(s[i]);
             if (std::isxdigit(c)) result += static_cast<char>(std::toupper(c));
@@ -5153,12 +5261,22 @@ private:
         const bool is_i2c_dev = (emu_kind2 == nfc_app::DeviceKind::GroveNFC ||
                                  emu_kind2 == nfc_app::DeviceKind::NFCUnit);
         const bool is_nfcunit = (emu_kind2 == nfc_app::DeviceKind::NFCUnit);
-        // Match render: show Write to Tag if the record was captured from I2C
-        // or the device is currently an I2C device.
+        const bool is_pn532_dev = (emu_kind2 == nfc_app::DeviceKind::PN532 ||
+                                   emu_kind2 == nfc_app::DeviceKind::PN532Killer);
+        const bool is_pn532killer = (emu_kind2 == nfc_app::DeviceKind::PN532Killer);
         const auto &rec = saved_records_[saved_idx_];
         const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
-        const bool show_write_to_tag = is_i2c_dev || record_from_i2c;
-        const int n_opts = show_write_to_tag ? 5 : 4;
+        const bool show_write_to_tag = is_i2c_dev || is_pn532_dev || record_from_i2c;
+        const bool has_first_action = is_i2c_dev || is_pn532killer;
+        const int n_opts = has_first_action ? (show_write_to_tag ? 5 : 4)
+                                            : (show_write_to_tag ? 4 : 3);
+        // Write to Tag is now first; Emulate/Upload is second
+        const int idx_write   = show_write_to_tag ? 0 : -1;
+        const int idx_emu     = has_first_action ? (show_write_to_tag ? 1 : 0) : -1;
+        const int idx_name    = has_first_action ? (show_write_to_tag ? 2 : 1)
+                                                  : (show_write_to_tag ? 1 : 0);
+        const int idx_hex     = idx_name + 1;
+        const int idx_delete  = idx_hex + 1;
 
         switch (key) {
         case KEY_UP:
@@ -5166,8 +5284,40 @@ private:
         case KEY_DOWN:
         case KEY_X:    modal_idx_ = (modal_idx_ + 1) % n_opts; break;
         case KEY_ENTER:
-            if (modal_idx_ == 0) {
-                // Emulate / Upload to Slot
+            if (show_write_to_tag && modal_idx_ == idx_write) {
+                // Write to Tag — hide modal, use footer for progress
+                const bool protocol_ok = (rec.tag.protocol == nfc_app::ProtocolKind::MifareClassic ||
+                                          rec.tag.protocol == nfc_app::ProtocolKind::Iso14443A ||
+                                          rec.tag.protocol == nfc_app::ProtocolKind::Iso15693);
+                if (!protocol_ok) {
+                    ui_message_ = "Hardware not supported";
+                    modal_     = Modal::None;
+                    modal_idx_ = 0;
+                } else if (is_nfcunit) {
+                    modal_     = Modal::None;
+                    modal_idx_ = 0;
+                    start_nfcunit_write_async(saved_idx_);
+                } else if (is_i2c_dev) {
+                    ui_message_ = "Hardware not supported";
+                    modal_     = Modal::None;
+                    modal_idx_ = 0;
+                } else if (is_pn532_dev) {
+                    if (rec.tag.protocol == nfc_app::ProtocolKind::Iso15693 && !is_pn532killer) {
+                        ui_message_ = "ISO15693 write requires PN532Killer";
+                        modal_     = Modal::None;
+                        modal_idx_ = 0;
+                    } else {
+                        modal_     = Modal::None;
+                        modal_idx_ = 0;
+                        start_pn532_write_async(saved_idx_);
+                    }
+                } else {
+                    ui_message_ = "Connect a writer device first";
+                    modal_     = Modal::None;
+                    modal_idx_ = 0;
+                }
+            } else if (idx_emu >= 0 && modal_idx_ == idx_emu) {
+                // Emulate (I2C) / Upload to Slot (PN532Killer)
                 if (is_i2c_dev && service_.emulation_allowed(&ui_message_)) {
                     if (service_.i2c_emulate(rec.tag.protocol, rec, &ui_message_)) {
                         current_tab_ = Tab::Emulator;
@@ -5175,40 +5325,20 @@ private:
                     }
                     modal_     = Modal::None;
                     modal_idx_ = 0;
-                } else if (service_.emulation_allowed(&ui_message_)) {
+                } else if (is_pn532killer && service_.emulation_allowed(&ui_message_)) {
                     slot_select_idx_ = service_.selected_slot_index_for_protocol(rec.tag.protocol);
                     modal_ = Modal::SlotSelect;
                 }
-            } else if (show_write_to_tag && modal_idx_ == 1) {
-                // Write to Tag (NFCUnit only; others show "Hardware not supported")
-                if (!is_nfcunit) {
-                    ui_message_ = is_i2c_dev ? "Hardware not supported" : "Connect NFC Unit first";
-                    modal_     = Modal::None;
-                    modal_idx_ = 0;
-                } else if (rec.tag.protocol != nfc_app::ProtocolKind::MifareClassic &&
-                           rec.tag.protocol != nfc_app::ProtocolKind::Iso14443A &&
-                           rec.tag.protocol != nfc_app::ProtocolKind::Iso15693) {
-                    ui_message_ = "Hardware not supported";
-                    modal_     = Modal::None;
-                    modal_idx_ = 0;
-                } else {
-                    // Start async write
-                    ui_message_ = "Place tag on NFC Unit...";
-                    start_nfcunit_write_async(saved_idx_);
-                }
-            } else if ((show_write_to_tag && modal_idx_ == 2) || (!show_write_to_tag && modal_idx_ == 1)) {
-                // Edit Name
+            } else if (modal_idx_ == idx_name) {
                 edit_buf_ = rec.meta.display_name;
                 modal_ = Modal::EditName;
-            } else if ((show_write_to_tag && modal_idx_ == 3) || (!show_write_to_tag && modal_idx_ == 2)) {
-                // Edit Hex
+            } else if (modal_idx_ == idx_hex) {
                 const auto &lines = rec.tag.raw_data;
                 edit_hex_line_ = 0;
                 edit_buf_ = lines.empty() ? "" : strip_to_hex(lines[0]);
                 edit_hex_dirty_ = false;
                 modal_ = Modal::EditHex;
-            } else {
-                // Delete
+            } else if (modal_idx_ == idx_delete) {
                 std::string err;
                 const std::string record_id = rec.meta.record_id;
                 if (service_.delete_saved_record(record_id, &err)) {

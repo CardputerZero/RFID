@@ -35,5 +35,8 @@ dist_mfkey/
 screenshots/
 packaging/
 nfc_i2c_magic_probe.cpp
+
+# Local deploy script
+build_and_deploy.sh
 static_lib_v0.0.*.tar.gz
 static_lib

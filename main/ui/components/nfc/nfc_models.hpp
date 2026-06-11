@@ -157,6 +157,25 @@ inline ProtocolKind protocol_from_string(const std::string &value)
     return ProtocolKind::Unknown;
 }
 
+// PM3-compatible lowercase protocol keys
+inline std::string protocol_to_pm3_key(ProtocolKind p)
+{
+    switch (p) {
+    case ProtocolKind::Iso14443A:    return "iso14443a";
+    case ProtocolKind::MifareClassic:return "mifareclassic";
+    case ProtocolKind::Iso15693:     return "iso15693";
+    default:                         return "unknown";
+    }
+}
+
+inline ProtocolKind protocol_from_pm3_key(const std::string &value)
+{
+    if (value == "iso14443a")     return ProtocolKind::Iso14443A;
+    if (value == "mifareclassic") return ProtocolKind::MifareClassic;
+    if (value == "iso15693")      return ProtocolKind::Iso15693;
+    return protocol_from_string(value);
+}
+
 inline TransportKind transport_from_string(const std::string &value)
 {
     if (value == "USB")  return TransportKind::UsbSerial;
@@ -304,22 +323,90 @@ inline void from_json(const nlohmann::json &j, MifareClassicDump &value)
 
 inline void to_json(nlohmann::json &j, const TagInfo &value)
 {
-    j = nlohmann::json{
-        {"protocol", to_string(value.protocol)},
-        {"tag_type", value.tag_type},
-        {"uid", value.uid},
-        {"identity_fields", value.identity_fields},
-        {"raw_data", value.raw_data},
-    };
+    // Serialize as PM3-compatible blocks + card format.
+    // Build card info from tag fields.
+    j["card"]["protocol"] = protocol_to_pm3_key(value.protocol);
+    j["card"]["uid"] = value.uid;
+    if (!value.tag_type.empty())
+        j["card"]["type"] = value.tag_type;
+    for (const auto &kv : value.identity_fields) {
+        if (!kv.second.empty())
+            j["card"][kv.first] = kv.second;
+    }
+
+    // Serialize raw_data as blocks map with zero-padded keys for correct
+    // numeric sort order (00,01,...09,10,11... instead of 0,1,10,11,2,3...).
+    for (size_t i = 0; i < value.raw_data.size(); ++i) {
+        const std::string &line = value.raw_data[i];
+        std::string key;
+        std::string hex;
+        size_t colon = line.find(':');
+        if (colon != std::string::npos && colon + 1 < line.size()) {
+            key = line.substr(0, colon);
+            // Strip leading zeros but ensure at least "0" for key lookup
+            while (key.size() > 1 && key[0] == '0') key.erase(0, 1);
+            hex = line.substr(colon + 1);
+        } else {
+            key = std::to_string(i);
+            hex = line;
+        }
+        // Pad to 2-digit key for correct alphabetical=numerical sort
+        if (key.size() < 2) key = "0" + key;
+        std::string pure;
+        for (char c : hex)
+            if (std::isxdigit(static_cast<unsigned char>(c)))
+                pure += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (!pure.empty())
+            j["blocks"][key] = pure;
+    }
+    if (!j.contains("blocks")) j["blocks"] = nlohmann::json::object();
 }
 
 inline void from_json(const nlohmann::json &j, TagInfo &value)
 {
-    value.protocol = protocol_from_string(j.value("protocol", "UNKNOWN"));
-    value.tag_type = j.value("tag_type", "Unknown");
-    value.uid = j.value("uid", "");
-    value.identity_fields = j.value("identity_fields", std::map<std::string, std::string>{});
-    value.raw_data = j.value("raw_data", std::vector<std::string>{});
+    // Read card info
+    if (j.contains("card")) {
+        const auto &card = j["card"];
+        value.protocol = protocol_from_pm3_key(card.value("protocol", "UNKNOWN"));
+        value.uid = card.value("uid", "");
+        value.tag_type = card.value("type", card.value("tag_type", ""));
+        for (auto it = card.begin(); it != card.end(); ++it) {
+            if (it.key() == "protocol" || it.key() == "uid" || it.key() == "type" || it.key() == "tag_type")
+                continue;
+            if (it.value().is_string())
+                value.identity_fields[it.key()] = it.value().get<std::string>();
+        }
+    } else {
+        // Legacy backward compat
+        value.protocol = protocol_from_string(j.value("protocol", "UNKNOWN"));
+        value.tag_type = j.value("tag_type", "Unknown");
+        value.uid = j.value("uid", "");
+        value.identity_fields = j.value("identity_fields", std::map<std::string, std::string>{});
+    }
+
+    // Read blocks → convert to "NN: HEX..." lines for raw_data
+    value.raw_data.clear();
+    if (j.contains("blocks") && j["blocks"].is_object()) {
+        for (auto it = j["blocks"].begin(); it != j["blocks"].end(); ++it) {
+            std::string pure;
+            if (it.value().is_string()) {
+                for (char c : it.value().get<std::string>())
+                    if (std::isxdigit(static_cast<unsigned char>(c)))
+                        pure += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+            if (!pure.empty()) {
+                // Strip leading zeros from key (e.g. "00" → "0", "01" → "1")
+                std::string key = it.key();
+                while (key.size() > 1 && key[0] == '0') key.erase(0, 1);
+                value.raw_data.push_back(key + ":" + pure);
+            }
+        }
+    }
+
+    // Legacy fallback: if no blocks, try old raw_data array
+    if (value.raw_data.empty() && j.contains("raw_data") && j["raw_data"].is_array()) {
+        value.raw_data = j.value("raw_data", std::vector<std::string>{});
+    }
 }
 
 inline void to_json(nlohmann::json &j, const EmulatorSlotRecord &value)

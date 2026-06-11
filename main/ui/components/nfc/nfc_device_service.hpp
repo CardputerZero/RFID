@@ -1851,12 +1851,361 @@ public:
             return false;
         }
 
+        // Stop any active listener/emulation before switching to reader mode
+        i2c_dev->nfcunit_stop_listener();
+
         return i2c_dev->writeCard(record.tag.protocol, record.tag.tag_type,
                                   record.tag.raw_data, &mifare_keys_hex_list_,
                                   progress, error);
     }
 
-    // Set MIFARE key list for authentication (used by both dump and write).
+    // Write tag data via PN532 / PN532Killer (UART/USB transport).
+    // First scans for a tag, detects its type, then routes to the appropriate
+    // write path based on the LIVE CARD (not the saved record's protocol).
+    bool pn532_write_tag(const SavedRecord &record,
+                         const std::function<void(const std::string &)> *progress = nullptr,
+                         std::string *error = nullptr)
+    {
+        INfcTransport *t = nullptr;
+        DeviceKind kind = DeviceKind::Unknown;
+        bool busy = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            busy = scan_.running;
+            t = transport_.get();
+            kind = connection_.device_kind;
+        }
+        if (busy) {
+            if (error) *error = "Scan/dump running";
+            return false;
+        }
+        if (!t || !t->is_open()) {
+            if (error) *error = "PN532 not connected";
+            return false;
+        }
+        if (kind != DeviceKind::PN532 && kind != DeviceKind::PN532Killer) {
+            if (error) *error = "Only PN532/PN532Killer supports this write";
+            return false;
+        }
+
+        Pn532KillerClient client(t);
+        const auto &lines = record.tag.raw_data;
+        const auto &tag_type = record.tag.tag_type;
+
+        if (lines.empty()) {
+            if (error) *error = "No data to write";
+            return false;
+        }
+
+        auto emit = [&](const std::string &s) {
+            if (progress && *progress) (*progress)(s);
+        };
+
+        // First, scan for a card and detect its type from the LIVE CARD.
+        // We never trust the saved record's protocol — the physical card
+        // may differ from what was originally scanned.
+        emit("Scanning for card...");
+        client.send_wakeup();
+        client.sam_configuration(nullptr);
+
+        TagInfo live_tag;
+        if (client.in_list_passive_target_iso14443a(&live_tag, nullptr)) {
+            // ISO14443A card detected — route based on live SAK
+            emit("Found " + live_tag.tag_type + " UID:" + live_tag.uid);
+            NfcHexLog::get().log_event("write", ("Found " + live_tag.tag_type + " UID:" + live_tag.uid).c_str());
+            // classify_type2_tag() probes may have exhausted the card.
+            // Re-select cleanly before writing.
+            client.iso14443a_reselect_for_write();
+            NfcHexLog::get().log_event("write", "card re-selected, routing to write...");
+            if (live_tag.protocol == ProtocolKind::MifareClassic) {
+                return pn532_write_mfc_with_tag(client, live_tag, lines, emit, error);
+            } else {
+                // NTAG / MFU / other Type 2
+                return pn532_write_mfu_with_tag(client, live_tag, lines, emit, error);
+            }
+        }
+
+        // Try ISO15693
+        TagInfo iso15_tag;
+        if (kind == DeviceKind::PN532Killer &&
+            client.in_list_passive_target_iso15693(&iso15_tag, nullptr)) {
+            emit("Found " + iso15_tag.tag_type + " UID:" + iso15_tag.uid);
+            NfcHexLog::get().log_event("write", ("Found " + iso15_tag.tag_type + " UID:" + iso15_tag.uid).c_str());
+            return pn532_write_iso15693_with_tag(client, iso15_tag, lines, emit, error);
+        }
+
+        if (error) *error = "No writable card detected";
+        return false;
+    }
+
+private:
+    static void pn532_parse_blocks(const std::vector<std::string> &lines,
+                                   int block_count,
+                                   std::vector<std::vector<uint8_t>> &blocks)
+    {
+        blocks.resize(static_cast<size_t>(block_count));
+        int line_idx = 0;
+        for (const auto &line : lines) {
+            if (line.empty()) { ++line_idx; continue; }
+            size_t colon = line.find(':');
+            int blk = line_idx;
+            std::string hex;
+            if (colon != std::string::npos && colon + 1 < line.size()) {
+                try { blk = std::stoi(line.substr(0, colon)); } catch (...) { blk = line_idx; }
+                hex = line.substr(colon + 1);
+            } else {
+                hex = line;
+            }
+            if (blk < 0 || blk >= block_count) { ++line_idx; continue; }
+            auto &dst = blocks[static_cast<size_t>(blk)];
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                if (!std::isxdigit(static_cast<unsigned char>(hex[i])) ||
+                    !std::isxdigit(static_cast<unsigned char>(hex[i + 1]))) continue;
+                dst.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+            }
+            if (dst.size() > 16) dst.resize(16);
+            ++line_idx;
+        }
+    }
+
+    // ── PN532 MFC write — uses already-scanned tag ─────────────────────
+    static bool pn532_write_mfc_with_tag(Pn532KillerClient &client,
+                                         const TagInfo &live_tag,
+                                         const std::vector<std::string> &lines,
+                                         const std::function<void(const std::string &)> &emit,
+                                         std::string *error)
+    {
+        const int block_count = (live_tag.tag_type.find("4K") != std::string::npos) ? 256 : 64;
+        std::vector<std::vector<uint8_t>> blocks;
+        pn532_parse_blocks(lines, block_count, blocks);
+
+        if (blocks[0].size() < 16) {
+            if (error) *error = "Missing block 0 in dump data";
+            return false;
+        }
+
+        std::vector<uint8_t> uid_bytes;
+        uid_bytes.reserve(live_tag.uid.size() / 2);
+        for (size_t i = 0; i + 1 < live_tag.uid.size(); i += 2)
+            uid_bytes.push_back(static_cast<uint8_t>(std::strtoul(live_tag.uid.substr(i, 2).c_str(), nullptr, 16)));
+        if (uid_bytes.size() < 4) {
+            if (error) *error = "Invalid UID";
+            return false;
+        }
+        uint8_t uid4[4] = {uid_bytes[0], uid_bytes[1], uid_bytes[2], uid_bytes[3]};
+
+        static const uint8_t default_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        static const uint8_t key_a0a1[6]    = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5};
+
+        const int sector_count = (block_count == 256) ? 40 : 16;
+        int written = 0;
+
+        for (int sector = 0; sector < sector_count; ++sector) {
+            const int first_block = (sector < 32) ? sector * 4 : 128 + (sector - 32) * 16;
+            const int sector_blocks = (sector < 32) ? 4 : 16;
+            const int trailer_block = first_block + sector_blocks - 1;
+
+            if (sector > 0) {
+                client.send_wakeup();
+                client.sam_configuration(nullptr);
+                TagInfo retag;
+                if (!client.in_list_passive_target_iso14443a(&retag, nullptr)) {
+                    emit("Sector " + std::to_string(sector) + " re-select failed, skipping");
+                    continue;
+                }
+            }
+
+            NfcHexLog::get().log_event("write", ("Sector " + std::to_string(sector) + " auth...").c_str());
+            std::string auth_err;
+            bool authed = client.mf_authenticate(static_cast<uint8_t>(first_block), false, default_key, uid4, &auth_err);
+            if (!authed) {
+                authed = client.mf_authenticate(static_cast<uint8_t>(first_block), true, default_key, uid4, nullptr);
+            }
+            if (!authed) {
+                authed = client.mf_authenticate(static_cast<uint8_t>(first_block), false, key_a0a1, uid4, nullptr);
+                if (!authed)
+                    authed = client.mf_authenticate(static_cast<uint8_t>(first_block), true, key_a0a1, uid4, nullptr);
+            }
+            if (!authed) {
+                emit("Sector " + std::to_string(sector) + " auth failed, skipping");
+                NfcHexLog::get().log_event("write", ("Sector " + std::to_string(sector) + " auth FAILED").c_str());
+                continue;
+            }
+            NfcHexLog::get().log_event("write", ("Sector " + std::to_string(sector) + " auth OK").c_str());
+
+            for (int i = 0; i < sector_blocks; ++i) {
+                const int blk = first_block + i;
+                if (blk == trailer_block) continue;
+                if (blocks[static_cast<size_t>(blk)].size() < 16) continue;
+
+                std::string wr_err;
+                if (client.mf_write_block_auth(static_cast<uint8_t>(blk), blocks[static_cast<size_t>(blk)], &wr_err)) {
+                    ++written;
+                    // Show block index + first 8 hex chars in footer
+                    char progress[64];
+                    const auto &bdata = blocks[static_cast<size_t>(blk)];
+                    std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X%02X%02X%02X%02X...",
+                                  blk, bdata[0], bdata[1], bdata[2], bdata[3],
+                                  bdata[4], bdata[5], bdata[6], bdata[7]);
+                    emit(progress);
+                } else {
+                    NfcHexLog::get().log_event("write", ("Write block " + std::to_string(blk) + " FAILED: " + wr_err).c_str());
+                    emit("Write block " + std::to_string(blk) + " failed");
+                }
+            }
+        }
+
+        emit("MFC write done: " + std::to_string(written) + " blocks");
+        if (error) error->clear();
+        return written > 0;
+    }
+
+    // ── PN532 NTAG/MFU write — uses already-scanned tag ────────────────
+    static bool pn532_write_mfu_with_tag(Pn532KillerClient &client,
+                                         const TagInfo &live_tag,
+                                         const std::vector<std::string> &lines,
+                                         const std::function<void(const std::string &)> &emit,
+                                         std::string *error)
+    {
+        std::map<int, std::vector<uint8_t>> pages;
+        int line_idx = 0;
+        for (const auto &line : lines) {
+            if (line.empty()) { ++line_idx; continue; }
+            size_t colon = line.find(':');
+            int pg = line_idx;
+            std::string hex;
+            if (colon != std::string::npos && colon + 1 < line.size()) {
+                // "NN: HEX" format — parse page number from prefix
+                try { pg = std::stoi(line.substr(0, colon)); } catch (...) { pg = line_idx; }
+                hex = line.substr(colon + 1);
+            } else {
+                // Raw hex — use line index as page number
+                hex = line;
+            }
+            if (pg < 0) { ++line_idx; continue; }
+            auto &dst = pages[pg];
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                if (!std::isxdigit(static_cast<unsigned char>(hex[i])) ||
+                    !std::isxdigit(static_cast<unsigned char>(hex[i + 1]))) continue;
+                dst.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+            }
+            if (dst.size() > 4) dst.resize(4);
+            ++line_idx;
+        }
+
+        if (pages.empty()) {
+            if (error) *error = "No page data to write";
+            return false;
+        }
+
+        int written = 0;
+        for (auto &kv : pages) {
+            const int pg = kv.first;
+            if (pg < 4) continue;
+            auto &data = kv.second;
+            if (data.size() < 4) data.resize(4, 0);
+
+            // Build hex representation for progress display
+            char data_hex[9];
+            std::snprintf(data_hex, sizeof(data_hex), "%02X%02X%02X%02X",
+                          data[0], data[1], data[2], data[3]);
+
+            std::vector<uint8_t> cmd = {0xA2, static_cast<uint8_t>(pg)};
+            cmd.insert(cmd.end(), data.begin(), data.begin() + 4);
+            std::vector<uint8_t> resp;
+            std::string wr_err;
+            if (client.in_data_exchange(0x01, cmd, &resp, &wr_err)) {
+                ++written;
+                char progress[48];
+                std::snprintf(progress, sizeof(progress), "Write page %d:%s", pg, data_hex);
+                emit(progress);
+            } else {
+                NfcHexLog::get().log_event("write", ("Write page " + std::to_string(pg) + " FAILED: " + wr_err).c_str());
+                char msg[64];
+                std::snprintf(msg, sizeof(msg), "Write page %d failed", pg);
+                emit(msg);
+            }
+        }
+
+        emit("NTAG write done: " + std::to_string(written) + " pages");
+        if (error) error->clear();
+        return written > 0;
+    }
+
+    // ── PN532Killer ISO15693 write — uses already-scanned tag ──────────
+    static bool pn532_write_iso15693_with_tag(Pn532KillerClient &client,
+                                              const TagInfo &live_tag,
+                                              const std::vector<std::string> &lines,
+                                              const std::function<void(const std::string &)> &emit,
+                                              std::string *error)
+    {
+        std::map<int, std::vector<uint8_t>> blk_data;
+        int line_idx = 0;
+        for (const auto &line : lines) {
+            if (line.empty()) { ++line_idx; continue; }
+            size_t colon = line.find(':');
+            int blk = line_idx;
+            std::string hex;
+            if (colon != std::string::npos && colon + 1 < line.size()) {
+                try { blk = std::stoi(line.substr(0, colon)); } catch (...) { blk = line_idx; }
+                hex = line.substr(colon + 1);
+            } else {
+                hex = line;
+            }
+            if (blk < 0) { ++line_idx; continue; }
+            auto &dst = blk_data[blk];
+            for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                if (!std::isxdigit(static_cast<unsigned char>(hex[i])) ||
+                    !std::isxdigit(static_cast<unsigned char>(hex[i + 1]))) continue;
+                dst.push_back(static_cast<uint8_t>(std::strtoul(hex.substr(i, 2).c_str(), nullptr, 16)));
+            }
+            ++line_idx;
+        }
+
+        if (blk_data.empty()) {
+            if (error) *error = "No block data to write";
+            return false;
+        }
+
+        int written = 0;
+        for (auto &kv : blk_data) {
+            const int blk = kv.first;
+            auto &data = kv.second;
+            if (data.size() < 4) data.resize(4, 0);
+
+            std::vector<uint8_t> cmd = {0x22, 0x21};
+            for (int i = 7; i >= 0; --i) {
+                if (static_cast<size_t>(i) < live_tag.uid.size() / 2)
+                    cmd.push_back(static_cast<uint8_t>(std::strtoul(live_tag.uid.substr(i * 2, 2).c_str(), nullptr, 16)));
+                else
+                    cmd.push_back(0);
+            }
+            cmd.push_back(static_cast<uint8_t>(blk & 0xFF));
+            cmd.push_back(static_cast<uint8_t>((blk >> 8) & 0xFF));
+            cmd.insert(cmd.end(), data.begin(), data.begin() + 4);
+
+            std::vector<uint8_t> resp;
+            std::string wr_err;
+            if (client.in_data_exchange(0x01, cmd, &resp, &wr_err)) {
+                ++written;
+                // Show block index + hex value in footer
+                char progress[64];
+                std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X",
+                              blk, data[0], data[1], data[2], data[3]);
+                emit(progress);
+            } else {
+                char msg[64];
+                std::snprintf(msg, sizeof(msg), "Write block %d failed", blk);
+                emit(msg);
+            }
+        }
+
+        emit("ISO15693 write done: " + std::to_string(written) + " blocks");
+        if (error) error->clear();
+        return written > 0;
+    }
+
+public:
     void set_mifare_key_list(const std::vector<std::string> &keys)
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -3188,11 +3537,14 @@ public:
     // No slot concept — data is loaded dynamically per protocol.
     bool i2c_emulate(ProtocolKind protocol, const SavedRecord &record, std::string *error = nullptr)
     {
-        // Save the record as default dump for this protocol (no lock needed)
         if (!record.tag.raw_data.empty()) {
             std::vector<uint8_t> bytes;
             for (const auto &line : record.tag.raw_data) {
+                // Strip "NN: " prefix if present
                 std::string hex = line;
+                size_t colon = hex.find(':');
+                if (colon != std::string::npos && colon + 1 < hex.size())
+                    hex = hex.substr(colon + 1);
                 for (size_t i = 0; i + 1 < hex.size(); i += 2) {
                     char *end = nullptr;
                     unsigned long val = std::strtoul(hex.substr(i, 2).c_str(), &end, 16);
@@ -3320,8 +3672,10 @@ public:
         tag.protocol = protocol;
         tag.uid = uid;
         for (const auto &line : dump_lines) {
-            if (line.size() > 4)
-                tag.raw_data.push_back(line.substr(4));
+            // Strip "NN: " prefix — use colon position, not fixed offset
+            size_t colon = line.find(':');
+            if (colon != std::string::npos && colon + 1 < line.size())
+                tag.raw_data.push_back(line.substr(colon + 1));
             else
                 tag.raw_data.push_back(line);
         }
@@ -3424,27 +3778,31 @@ public:
                     if (j.contains("card") && j["card"].contains("uid") && j["card"]["uid"].is_string()) {
                         uid_from_json = j["card"]["uid"].get<std::string>();
                     }
-                    // Parse blocks: { "0": "04311DA0", "1": "EA1B4503", ... }
+                    // Parse blocks: { "0": "04311DA0", ... } — handles both "0" and "00" keys
                     if (j.contains("blocks") && j["blocks"].is_object()) {
                         const auto &blocks = j["blocks"];
-                        // Sort by numeric key
                         std::vector<int> keys;
                         for (auto itb = blocks.begin(); itb != blocks.end(); ++itb) {
                             try { keys.push_back(std::stoi(itb.key())); } catch (...) {}
                         }
                         std::sort(keys.begin(), keys.end());
                         for (int k : keys) {
-                            std::string key_str = std::to_string(k);
-                            if (blocks.contains(key_str) && blocks[key_str].is_string()) {
-                                std::string hex = blocks[key_str].get<std::string>();
-                                // Convert to uppercase pure hex
-                                std::string pure;
-                                for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
-                                if (pure.empty()) continue;
-                                char prefix[16];
-                                std::snprintf(prefix, sizeof(prefix), "%02d:", k);
-                                lines.push_back(std::string(prefix) + pure);
-                            }
+                            // Look up by both zero-padded and plain key formats
+                            const std::string key_plain = std::to_string(k);
+                            char key_pad[4];
+                            std::snprintf(key_pad, sizeof(key_pad), "%02d", k);
+                            const std::string key_str = blocks.contains(key_pad) ? std::string(key_pad) :
+                                                         blocks.contains(key_plain) ? key_plain : "";
+                            if (key_str.empty()) continue;
+                            if (!blocks[key_str].is_string()) continue;
+                            std::string hex = blocks[key_str].get<std::string>();
+                            // Convert to uppercase pure hex
+                            std::string pure;
+                            for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
+                            if (pure.empty()) continue;
+                            char prefix[16];
+                            std::snprintf(prefix, sizeof(prefix), "%02d:", k);
+                            lines.push_back(std::string(prefix) + pure);
                         }
                     }
                     // Fallback: if no blocks field but data_hex present, chunk it

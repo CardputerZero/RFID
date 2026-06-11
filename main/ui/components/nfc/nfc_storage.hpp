@@ -170,8 +170,27 @@ public:
         }
 
         nlohmann::json document = record;
+        // Reorder blocks keys numerically (nlohmann::json sorts alphabetically by default)
+        reorder_blocks_keys(document);
         output << document.dump(2);
         return true;
+    }
+
+    // Reorder the "blocks" object keys in numeric order (0,1,2,... instead of 0,1,10,11,...)
+    static void reorder_blocks_keys(nlohmann::json &doc)
+    {
+        if (!doc.contains("blocks") || !doc["blocks"].is_object()) return;
+        std::vector<std::pair<int, std::string>> ordered;
+        for (auto it = doc["blocks"].begin(); it != doc["blocks"].end(); ++it) {
+            try { ordered.emplace_back(std::stoi(it.key()), it.key()); }
+            catch (...) { ordered.emplace_back(999999, it.key()); }
+        }
+        std::sort(ordered.begin(), ordered.end(),
+                  [](const auto &a, const auto &b) { return a.first < b.first; });
+        nlohmann::json reordered = nlohmann::json::object();
+        for (const auto &kv : ordered)
+            reordered[kv.second] = doc["blocks"][kv.second];
+        doc["blocks"] = std::move(reordered);
     }
 
     bool delete_record(const std::string &record_id, std::string *error = nullptr) const
@@ -704,11 +723,17 @@ public:
             std::string hex = (colon != std::string::npos && colon + 1 < line.size())
                 ? line.substr(colon + 1) : line;
             for (char c : hex) if (std::isxdigit((unsigned char)c)) pure += (char)std::toupper((unsigned char)c);
-            if (!pure.empty()) j["blocks"][std::to_string(i)] = pure;
+            // Zero-padded key for correct numeric sort order
+            char key_buf[4];
+            std::snprintf(key_buf, sizeof(key_buf), "%02d", static_cast<int>(i));
+            if (!pure.empty()) j["blocks"][std::string(key_buf)] = pure;
         }
 
         std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
-        if (out.is_open()) out << j.dump(2);
+        if (out.is_open()) {
+            reorder_blocks_keys(j);
+            out << j.dump(2);
+        }
     }
 
     // Write raw NTAG page bytes (4 bytes per page) directly as the NTAG emulator JSON.
@@ -728,10 +753,13 @@ public:
             char hex[9];
             std::snprintf(hex, sizeof(hex), "%02X%02X%02X%02X",
                           mem[i * 4], mem[i * 4 + 1], mem[i * 4 + 2], mem[i * 4 + 3]);
-            j["blocks"][std::to_string(i)] = std::string(hex);
+            char key_buf[4];
+            std::snprintf(key_buf, sizeof(key_buf), "%02d", static_cast<int>(i));
+            j["blocks"][std::string(key_buf)] = std::string(hex);
         }
         std::ofstream out(path.c_str(), std::ios::out | std::ios::trunc);
         if (!out.is_open()) return false;
+        reorder_blocks_keys(j);
         out << j.dump(2);
         return true;
     }

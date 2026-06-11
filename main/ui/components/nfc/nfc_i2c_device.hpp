@@ -4321,6 +4321,12 @@ private:
                 }
                 if (mfc_write_block_enc(crypto, static_cast<uint8_t>(blk), blocks[static_cast<size_t>(blk)])) {
                     ++written;
+                    char progress[64];
+                    const auto &bdata = blocks[static_cast<size_t>(blk)];
+                    std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X%02X%02X%02X%02X...",
+                                  blk, bdata[0], bdata[1], bdata[2], bdata[3],
+                                  bdata[4], bdata[5], bdata[6], bdata[7]);
+                    emit(progress);
                 } else {
                     emit("Write block " + std::to_string(blk) + " failed");
                 }
@@ -4383,21 +4389,27 @@ private:
         }
 
         int written = 0;
+        // NTAG: skip first 4 pages (page 0-3) to preserve UID/manufacturer data
         for (const auto &kv : pages) {
             uint8_t pg = kv.first;
+            if (pg < 4) continue;  // skip first 4 pages
             const auto &data = kv.second;
             // COMPLIANCE_WRITE: 0xA2 + page + 4 bytes
             uint8_t cmd[6] = {0xA2, pg, data[0], data[1], data[2], data[3]};
             uint8_t rx[4] = {0};
             uint8_t rx_len = 4;
             if (!st25r_nfca_transceive(cmd, 6, true, rx, rx_len, 50, 0x00, false, 0)) {
-                emit("MFU write page " + std::to_string(pg) + " failed");
+                emit("Write page " + std::to_string(pg) + " failed");
                 continue;
             }
             if (rx_len > 0 && (rx[0] & 0x0F) == 0x0A) {
                 ++written;
+                char progress[64];
+                std::snprintf(progress, sizeof(progress), "Write page %d:%02X%02X%02X%02X",
+                              pg, data[0], data[1], data[2], data[3]);
+                emit(progress);
             } else {
-                emit("MFU write page " + std::to_string(pg) + " NAK");
+                emit("Write page " + std::to_string(pg) + " NAK");
             }
         }
 
@@ -4483,14 +4495,23 @@ private:
             uint8_t dec_len = 0;
             if (!st25r_nfcv_transceive(req.data(), static_cast<uint8_t>(req.size()),
                                        dec, dec_len, 80) || dec_len < 1) {
-                emit("ISO15693 write block " + std::to_string(blk) + " timeout");
+                emit("Write block " + std::to_string(blk) + " timeout");
                 continue;
             }
             if (dec[0] & 0x01) {
-                emit("ISO15693 write block " + std::to_string(blk) + " error");
+                emit("Write block " + std::to_string(blk) + " error");
                 continue;
             }
             ++written;
+            // Show block index + first 4 hex bytes in footer
+            char progress[64];
+            std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X",
+                          blk,
+                          data.size() > 0 ? data[0] : 0,
+                          data.size() > 1 ? data[1] : 0,
+                          data.size() > 2 ? data[2] : 0,
+                          data.size() > 3 ? data[3] : 0);
+            emit(progress);
         }
 
         restore_iso14443a();
