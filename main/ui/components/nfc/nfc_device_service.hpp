@@ -5574,6 +5574,7 @@ private:
                 if (device_kind == DeviceKind::PN532Killer) {
                     std::string err15;
                     tag = TagInfo{};
+                    push_log("-> Trying ISO15693...");
                     real_ok = client.in_list_passive_target_iso15693(&tag, &err15);
                     if (!real_ok) {
                         push_log("No ISO15693 tag found");
