@@ -1887,6 +1887,13 @@ private:
         if (mifare_key_idx_ > static_cast<int>(mifare_keys_.size())) {
             mifare_key_idx_ = static_cast<int>(mifare_keys_.size());
         }
+        // Push enabled keys to the service so dump+write can use them for MFC auth.
+        std::vector<std::string> key_hex_list;
+        key_hex_list.reserve(mifare_keys_.size());
+        for (const auto &k : mifare_keys_) {
+            if (k.enabled && !k.key_hex.empty()) key_hex_list.push_back(k.key_hex);
+        }
+        service_.set_mifare_key_list(key_hex_list);
     }
 
     bool tools_focus_mode() const
@@ -4819,18 +4826,23 @@ private:
         const bool is_i2c_dev = (emu_kind == nfc_app::DeviceKind::GroveNFC ||
                                  emu_kind == nfc_app::DeviceKind::NFCUnit);
         const bool is_nfcunit = (emu_kind == nfc_app::DeviceKind::NFCUnit);
-        // NFCUnit/GroveNFC: Emulate, Write to Tag, Edit Name, Edit Hex, Delete (5 options)
-        // Others: Emulate/Upload, Edit Name, Edit Hex, Delete (4 options)
-        const int n_opts = is_i2c_dev ? 5 : 4;
+        const auto &rec = saved_records_[saved_idx_];
+        // Also check record metadata: dumps captured from I2C (NFCUnit/GroveNFC) should
+        // always show "Write to Tag", even when the device is not currently connected.
+        const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
+        const bool show_write_to_tag = is_i2c_dev || record_from_i2c;
+        // NFCUnit/GroveNFC connected: Emulate + Write, 5 options
+        // I2C record without active I2C connection: Upload to Slot + Write, 5 options
+        // Non-I2C record: Upload to Slot, 4 options
+        const int n_opts = show_write_to_tag ? 5 : 4;
         const lv_coord_t card_h = static_cast<lv_coord_t>(24 + n_opts * 20);
         // Width 220, dynamic height based on option count
         lv_obj_t *card = make_modal_card(parent, 220, card_h, 0xF7A600);
-        const auto &rec = saved_records_[saved_idx_];
         create_text(card, 8, 6, to_compact(rec.meta.display_name, 26).c_str(), 0xFFFFFF, 12);
 
         const char *upload_label = is_i2c_dev ? "Emulate" : "Upload to Slot...";
         std::vector<const char *> options = {upload_label};
-        if (is_i2c_dev) options.push_back("Write to Tag");
+        if (show_write_to_tag) options.push_back("Write to Tag");
         options.push_back("Edit Name");
         options.push_back("Edit Hex Data");
         options.push_back("Delete");
@@ -5141,7 +5153,12 @@ private:
         const bool is_i2c_dev = (emu_kind2 == nfc_app::DeviceKind::GroveNFC ||
                                  emu_kind2 == nfc_app::DeviceKind::NFCUnit);
         const bool is_nfcunit = (emu_kind2 == nfc_app::DeviceKind::NFCUnit);
-        const int n_opts = is_i2c_dev ? 5 : 4;  // I2C: Emulate/Write/Name/Hex/Delete
+        // Match render: show Write to Tag if the record was captured from I2C
+        // or the device is currently an I2C device.
+        const auto &rec = saved_records_[saved_idx_];
+        const bool record_from_i2c = (rec.meta.transport == nfc_app::TransportKind::I2cBus);
+        const bool show_write_to_tag = is_i2c_dev || record_from_i2c;
+        const int n_opts = show_write_to_tag ? 5 : 4;
 
         switch (key) {
         case KEY_UP:
@@ -5151,9 +5168,7 @@ private:
         case KEY_ENTER:
             if (modal_idx_ == 0) {
                 // Emulate / Upload to Slot
-                const bool is_grove = is_i2c_dev;
-                if (is_grove && service_.emulation_allowed(&ui_message_)) {
-                    const auto &rec = saved_records_[saved_idx_];
+                if (is_i2c_dev && service_.emulation_allowed(&ui_message_)) {
                     if (service_.i2c_emulate(rec.tag.protocol, rec, &ui_message_)) {
                         current_tab_ = Tab::Emulator;
                         ui_message_ = "Emulation started";
@@ -5161,14 +5176,13 @@ private:
                     modal_     = Modal::None;
                     modal_idx_ = 0;
                 } else if (service_.emulation_allowed(&ui_message_)) {
-                    slot_select_idx_ = service_.selected_slot_index_for_protocol(saved_records_[saved_idx_].tag.protocol);
+                    slot_select_idx_ = service_.selected_slot_index_for_protocol(rec.tag.protocol);
                     modal_ = Modal::SlotSelect;
                 }
-            } else if (is_i2c_dev && modal_idx_ == 1) {
-                // Write to Tag (NFCUnit only; GroveNFC shows "Hardware not supported")
-                const auto &rec = saved_records_[saved_idx_];
+            } else if (show_write_to_tag && modal_idx_ == 1) {
+                // Write to Tag (NFCUnit only; others show "Hardware not supported")
                 if (!is_nfcunit) {
-                    ui_message_ = "Hardware not supported";
+                    ui_message_ = is_i2c_dev ? "Hardware not supported" : "Connect NFC Unit first";
                     modal_     = Modal::None;
                     modal_idx_ = 0;
                 } else if (rec.tag.protocol != nfc_app::ProtocolKind::MifareClassic &&
@@ -5182,13 +5196,13 @@ private:
                     ui_message_ = "Place tag on NFC Unit...";
                     start_nfcunit_write_async(saved_idx_);
                 }
-            } else if ((is_i2c_dev && modal_idx_ == 2) || (!is_i2c_dev && modal_idx_ == 1)) {
+            } else if ((show_write_to_tag && modal_idx_ == 2) || (!show_write_to_tag && modal_idx_ == 1)) {
                 // Edit Name
-                edit_buf_ = saved_records_[saved_idx_].meta.display_name;
+                edit_buf_ = rec.meta.display_name;
                 modal_ = Modal::EditName;
-            } else if ((is_i2c_dev && modal_idx_ == 3) || (!is_i2c_dev && modal_idx_ == 2)) {
+            } else if ((show_write_to_tag && modal_idx_ == 3) || (!show_write_to_tag && modal_idx_ == 2)) {
                 // Edit Hex
-                const auto &lines = saved_records_[saved_idx_].tag.raw_data;
+                const auto &lines = rec.tag.raw_data;
                 edit_hex_line_ = 0;
                 edit_buf_ = lines.empty() ? "" : strip_to_hex(lines[0]);
                 edit_hex_dirty_ = false;
@@ -5196,7 +5210,7 @@ private:
             } else {
                 // Delete
                 std::string err;
-                const std::string record_id = saved_records_[saved_idx_].meta.record_id;
+                const std::string record_id = rec.meta.record_id;
                 if (service_.delete_saved_record(record_id, &err)) {
                     refresh_saved_records();
                     ui_message_ = "Deleted";
@@ -5269,8 +5283,11 @@ private:
             service_.current_emulator_protocol() == nfc_app::ProtocolKind::Iso14443A;
         const int emu_slot = (i2c_emu_mode || st25r_mode) ? 0 : hw_emu_slot_;
         const bool dump_ready = service_.emu_dump_loaded(service_.current_emulator_protocol(), emu_slot);
+        const bool pn532k_mode = !st25r_mode && !i2c_emu_mode && !pn532_ndef_menu;
         const int n_opts = pn532_ndef_menu ? 1 :
-                          (st25r_mode ? 4 : (i2c_url_mode ? 4 : 3));
+                          (st25r_mode ? 4 :
+                          (pn532k_mode ? 3 :
+                          (i2c_url_mode ? 2 : 1)));
         switch (key) {
         case KEY_UP:
         case KEY_F:    modal_idx_ = (modal_idx_ + n_opts - 1) % n_opts; break;

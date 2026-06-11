@@ -35,3 +35,4 @@ dist_mfkey/
 screenshots/
 packaging/
 nfc_i2c_magic_probe.cpp
+static_lib_v0.0.*.tar.gz
