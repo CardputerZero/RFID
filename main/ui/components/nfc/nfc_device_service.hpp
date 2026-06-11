@@ -5568,10 +5568,12 @@ private:
                         std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 }
             }
-            // For PN532Killer: also try ISO15693 if 14A found nothing.
+            // Try ISO15693 if 14A found nothing — for PN532Killer, also
+            // try ISO14443B before falling back to the hex log overlay.
             if (!real_ok) {
                 push_log("No ISO14443A tag found");
-                if (device_kind == DeviceKind::PN532Killer) {
+                // ISO15693 (PN532Killer only)
+                if (!real_ok && device_kind == DeviceKind::PN532Killer) {
                     std::string err15;
                     tag = TagInfo{};
                     push_log("-> Trying ISO15693...");
@@ -5580,7 +5582,8 @@ private:
                         push_log("No ISO15693 tag found");
                         error = err15.empty() ? "No tag found" : err15;
                     }
-                } else {
+                }
+                if (!real_ok) {
                     error = error.empty() ? "No tag found" : error;
                 }
             }

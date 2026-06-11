@@ -352,8 +352,17 @@ public:
 
     TransportEndpoint endpoint() const override { return inner_->endpoint(); }
 
+    void flush_rx()
+    {
+        if (rx_buf_.empty()) return;
+        NfcHexLog::get().log_rx(tag_.c_str(), rx_buf_.data(), rx_buf_.size());
+        rx_buf_.clear();
+    }
+
     ssize_t write_bytes(const uint8_t *data, size_t size, std::string *error) override
     {
+        // Flush buffered RX before TX so the previous response is visible.
+        flush_rx();
         const ssize_t ret = inner_->write_bytes(data, size, error);
         if (ret > 0)
             NfcHexLog::get().log_tx(tag_.c_str(), data, static_cast<size_t>(ret));
@@ -363,25 +372,46 @@ public:
     ssize_t read_bytes(uint8_t *buffer, size_t size, int timeout_ms, std::string *error) override
     {
         const ssize_t ret = inner_->read_bytes(buffer, size, timeout_ms, error);
-        if (ret <= 0) return ret;
-
-        // Drain any immediately available continuation bytes (0 ms timeout)
-        // so the whole response frame lands in a single log line.
-        size_t total = static_cast<size_t>(ret);
-        while (total < size) {
-            const ssize_t more = inner_->read_bytes(buffer + total, size - total, 0, nullptr);
-            if (more <= 0) break;
-            total += static_cast<size_t>(more);
+        if (ret <= 0) {
+            if (!rx_buf_.empty()) flush_rx();
+            return ret;
         }
 
-        // Write one consolidated log line for the entire frame
-        NfcHexLog::get().log_rx(tag_.c_str(), buffer, total);
-        return static_cast<ssize_t>(total);
+        // Accumulate RX bytes. PN532 protocol reads byte-by-byte via
+        // collect_response(); accumulating here merges multi-byte frames
+        // into single log lines instead of one line per byte read.
+        if (rx_buf_.empty() && has_complete_pn532_frame({buffer, buffer + ret})) {
+            // First chunk is already a complete PN532 frame -> log directly.
+            NfcHexLog::get().log_rx(tag_.c_str(), buffer, static_cast<size_t>(ret));
+        } else {
+            rx_buf_.insert(rx_buf_.end(), buffer, buffer + ret);
+            if (has_complete_pn532_frame(rx_buf_)) flush_rx();
+        }
+        return ret;
     }
 
+    ~LoggingTransport() { flush_rx(); }
+
 private:
+    // Heuristic: return true when buf contains at least one complete PN532
+    // response frame (preamble 00 00 FF + LEN + LCS + data + DCS + postamble).
+    static bool has_complete_pn532_frame(const std::vector<uint8_t> &buf)
+    {
+        for (size_t i = 0; i + 7 < buf.size(); ++i) {
+            if (buf[i] != 0x00 || buf[i + 1] != 0x00 || buf[i + 2] != 0xFF) continue;
+            const uint8_t len = buf[i + 3];
+            const uint8_t lcs = buf[i + 4];
+            if (static_cast<uint8_t>(len + lcs) != 0x00) continue;
+            const size_t frame_end = i + 5 + static_cast<size_t>(len) + 2;
+            if (frame_end > buf.size()) return false;
+            if (buf[frame_end - 1] == 0x00) return true;
+        }
+        return false;
+    }
+
     std::unique_ptr<INfcTransport> inner_;
     std::string tag_;
+    std::vector<uint8_t> rx_buf_;
 };
 
 } // namespace nfc_app

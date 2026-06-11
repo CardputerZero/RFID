@@ -1155,7 +1155,7 @@ private:
 
         nfcunit_write_thread_ = std::thread([this, rec]() {
             std::string err;
-            auto progress_cb = [this](const std::string &line) {
+            std::function<void(const std::string &)> progress_cb = [this](const std::string &line) {
                 nfcunit_write_result_msg_ = line;
             };
             bool ok = service_.nfcunit_write_tag(rec, &progress_cb, &err);
