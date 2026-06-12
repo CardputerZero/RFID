@@ -488,7 +488,6 @@ inline void to_json(nlohmann::json &j, const SavedRecord &value)
     j = nlohmann::json{
         {"meta", value.meta},
         {"tag", value.tag},
-        {"mifare_classic_dump", value.mifare_dump ? nlohmann::json(*value.mifare_dump) : nlohmann::json()},
         {"emulator_slot", value.emulator_slot ? nlohmann::json(*value.emulator_slot) : nlohmann::json()},
     };
 }
@@ -519,12 +518,17 @@ inline std::string make_record_id(const TagInfo &tag)
 
 inline std::string make_record_name(const TagInfo &tag)
 {
-    std::string label = tag.tag_type.empty() ? std::string("Tag") : tag.tag_type;
-    if (!tag.uid.empty()) {
-        label += " ";
-        label += tag.uid;
+    std::string prefix;
+    switch (tag.protocol) {
+    case ProtocolKind::MifareClassic: prefix = "MFC_"; break;
+    case ProtocolKind::Iso14443A:     prefix = "N213_"; break;
+    case ProtocolKind::Iso15693:      prefix = "ISO15_"; break;
+    default:                          prefix = "Tag_"; break;
     }
-    return label;
+    if (!tag.uid.empty()) {
+        return prefix + tag.uid;
+    }
+    return prefix + "unknown";
 }
 
 } // namespace nfc_app

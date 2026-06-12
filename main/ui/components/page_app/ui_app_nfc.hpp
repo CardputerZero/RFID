@@ -865,6 +865,22 @@ private:
                 render_all();
             }
             break;
+        case KEY_D:
+            if (current_tab_ == Tab::Read) {
+                std::string dump_error;
+                if (!service_.can_dump_last_scan(&dump_error)) {
+                    ui_message_ = dump_error;
+                } else {
+                    scan_log_lines_.push_back("> Dump card...");
+                    if (service_.start_dump_last_scan()) {
+                        ui_message_ = "Dumping...";
+                    } else {
+                        ui_message_ = "Dump start failed";
+                    }
+                }
+                render_all();
+            }
+            break;
         case KEY_P:
             if (current_tab_ == Tab::Emulator) {
                 const auto conn = service_.connection_state();
