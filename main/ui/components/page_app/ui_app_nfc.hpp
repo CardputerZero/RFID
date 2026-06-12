@@ -1198,7 +1198,6 @@ private:
     {
         // All write progress messages start with "Write page" or "Write block"
         if (line.find("Write page") == 0 || line.find("Write block") == 0) {
-            // Check for failure keywords: failed, NAK, timeout, error
             bool success = (line.find("failed") == std::string::npos &&
                             line.find("NAK") == std::string::npos &&
                             line.find("timeout") == std::string::npos &&
@@ -1206,12 +1205,13 @@ private:
             write_progress_bar_ += success ? '.' : 'x';
             ui_message_ = "Writing: " + write_progress_bar_;
         } else if (line.find("Scanning") != std::string::npos ||
-                   line.find("Found") != std::string::npos) {
-            // Scan/card detection messages show directly
+                   line.find("Found") != std::string::npos ||
+                   line.find("Magic") != std::string::npos ||
+                   line.find("Gen1A") != std::string::npos ||
+                   line.find("MFC") != std::string::npos) {
+            // Card detection / magic-type / info messages show directly
             ui_message_ = line;
         }
-        // Other messages (final summaries like "NTAG write done: N pages") are ignored
-        // — they're shown in the final poll result
     }
 
     void poll_nfcunit_write_result()

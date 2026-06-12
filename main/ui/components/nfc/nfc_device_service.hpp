@@ -1853,6 +1853,8 @@ public:
 
         // Stop any active listener/emulation before switching to reader mode
         i2c_dev->nfcunit_stop_listener();
+        // Initialize ST25R3916B for reader mode if not yet configured
+        i2c_dev->nfcunit_init_reader();
 
         return i2c_dev->writeCard(record.tag.protocol, record.tag.tag_type,
                                   record.tag.raw_data, &mifare_keys_hex_list_,

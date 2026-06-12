@@ -1094,6 +1094,9 @@ public:
         return nfcunit_listener_running_;
     }
 
+    // Initialize ST25R3916B as NFC-A reader (call once after connection/power-on)
+    bool nfcunit_init_reader() { return st25r_init_nfca_reader(); }
+
     // Poll one listener frame. Returns true when a frame is received.
     // Output frame excludes trailing CRC_A bytes when present.
     bool nfcunit_poll_listener_frame(std::vector<uint8_t> &frame, int timeout_ms = 20)
@@ -4194,47 +4197,59 @@ private:
         auto emit = [&](const std::string &s) {
             if (progress && *progress) (*progress)(s);
         };
+        emit("Found " + selected_uid);
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         // ── Detect magic type ─────────────────────────────────────────────
         const std::string magic = st25r_detect_magic_type(selected_uid, sak, true);
+        if (!magic.empty())
+            emit("Magic: " + magic);
+        else
+            emit("MFC standard");
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         if (magic == "Gen1A") {
-            emit("Gen1A detected, writing block 0...");
-            // Gen1A: write block0 with backdoor, then plain-write remaining blocks
-            if (!writeNFCUnitGen1ABlock0(blocks[0], error)) {
+            emit("Gen1A detected, writing blocks...");
+            // Card is already unlocked by st25r_is_gen1a_magic inside detect.
+            // Write block 0 directly, then plain-write blocks 1..N.
+            uint8_t ack[4] = {0};
+            uint8_t ack_len = 4;
+            // Write block 0: A0 00 + 16 bytes
+            const uint8_t w0_cmd[2] = {0xA0, 0x00};
+            if (!st25r_nfca_transceive(w0_cmd, 2, true, ack, ack_len, 60, 0x00, false, 0) ||
+                !st25r_nfca_transceive(blocks[0].data(), 16, true, ack, ack_len, 60, 0x00, false, 0)) {
                 st25r_write_reg(0x02, 0x80);
+                if (error) *error = "Gen1A write block 0 failed";
                 return false;
             }
-            st25r_write_reg(0x02, 0x80);
-            // Re-select after block0 write
-            if (!st25r_nfca_select_uid(uid, sak)) {
-                if (error) *error = "Gen1A re-select after block0 failed";
-                return false;
-            }
+            char b0[64];
+            std::snprintf(b0, sizeof(b0), "Write block 0:%02X%02X%02X%02X%02X%02X%02X%02X...",
+                          blocks[0][0], blocks[0][1], blocks[0][2], blocks[0][3],
+                          blocks[0][4], blocks[0][5], blocks[0][6], blocks[0][7]);
+            emit(b0);
+            // Write remaining blocks 1..N with plain A0+block/16B
             auto plain_write = [&](int blk) -> bool {
-                if (blocks[static_cast<size_t>(blk)].size() < 16) return true; // skip incomplete
+                if (blocks[static_cast<size_t>(blk)].size() < 16) return true;
                 const uint8_t cmd[2] = {0xA0, static_cast<uint8_t>(blk)};
-                uint8_t ack[4] = {0};
-                uint8_t ack_len = 4;
-                if (!st25r_nfca_transceive(cmd, 2, true, ack, ack_len, 60, 0x00, false, 0))
+                uint8_t a1[4] = {0}, a1_len = 4;
+                if (!st25r_nfca_transceive(cmd, 2, true, a1, a1_len, 60, 0x00, false, 0)) return false;
+                uint8_t a2[4] = {0}, a2_len = 4;
+                if (!st25r_nfca_transceive(blocks[static_cast<size_t>(blk)].data(), 16, true, a2, a2_len, 60, 0x00, false, 0))
                     return false;
-                uint8_t wb[18] = {0};
-                std::copy(blocks[static_cast<size_t>(blk)].begin(), blocks[static_cast<size_t>(blk)].end(), wb);
-                uint8_t wb_len = 18;
-                const uint8_t *wb_data = wb;
-                // Block 0 uses backdoor already; remaining blocks use plain A0+block / 16B
-                uint8_t wb_ack[4] = {0};
-                uint8_t wb_ack_len = 4;
-                if (!st25r_nfca_transceive(wb_data, 16, true, wb_ack, wb_ack_len, 60, 0x00, false, 0))
-                    return false;
-                return (wb_ack_len > 0 && (wb_ack[0] & 0x0F) == 0x0A);
+                return (a2_len > 0 && (a2[0] & 0x0F) == 0x0A);
             };
             for (int blk = 1; blk < block_count; ++blk) {
                 if (!plain_write(blk)) {
-                    char msg[64];
-                    std::snprintf(msg, sizeof(msg), "Gen1A write block %d failed", blk);
-                    if (progress && *progress) (*progress)(msg);
-                    // continue best-effort
+                    emit("Write block " + std::to_string(blk) + " failed");
+                } else {
+                    char progress[64];
+                    const auto &bdata = blocks[static_cast<size_t>(blk)];
+                    std::snprintf(progress, sizeof(progress), "Write block %d:%02X%02X%02X%02X%02X%02X%02X%02X...",
+                                  blk, bdata[0], bdata[1], bdata[2], bdata[3],
+                                  bdata[4], bdata[5], bdata[6], bdata[7]);
+                    emit(progress);
                 }
             }
             st25r_write_reg(0x02, 0x80);
@@ -4359,9 +4374,23 @@ private:
             return false;
         }
 
+        const std::string selected_uid = hex_compact(uid.data(), uid.size());
+
         auto emit = [&](const std::string &s) {
             if (progress && *progress) (*progress)(s);
         };
+
+        // Verify card is MFU/NTAG (SAK=0x00)
+        if (sak != 0x00) {
+            char msg[64];
+            std::snprintf(msg, sizeof(msg), "Card SAK=0x%02X, expected NTAG/MFU (SAK=00)", sak);
+            if (error) *error = msg;
+            st25r_write_reg(0x02, 0x80);
+            return false;
+        }
+        emit("Found " + selected_uid);
+
+        std::this_thread::sleep_for(std::chrono::seconds(1));
 
         // Parse pages: "NN: XXXXXXXX"
         std::map<uint8_t, std::array<uint8_t, 4>> pages;
